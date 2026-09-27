@@ -154,6 +154,32 @@ class ProcurementService:
                     created_at TEXT NOT NULL,
                     resolved_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS announcements (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tender_id INTEGER NOT NULL REFERENCES tenders(id),
+                    evaluation_round INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    ranking_snapshot TEXT NOT NULL,
+                    winner_bid_id INTEGER NOT NULL,
+                    objection_deadline TEXT NOT NULL,
+                    published_by TEXT NOT NULL,
+                    published_at TEXT NOT NULL,
+                    invalidated_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_announcement_active_round
+                    ON announcements(tender_id,evaluation_round) WHERE status='active';
+                CREATE TABLE IF NOT EXISTS objections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    announcement_id INTEGER NOT NULL REFERENCES announcements(id),
+                    tender_id INTEGER NOT NULL REFERENCES tenders(id),
+                    objector TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    resolution TEXT,
+                    reviewed_by TEXT,
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS timeline (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     tender_id INTEGER REFERENCES tenders(id),
@@ -514,53 +540,225 @@ class ProcurementService:
             self._audit(conn, complaint["tender_id"], actor, "complaint.resolved", {"complaint_id": complaint_id, "decision": decision})
             return dict(conn.execute("SELECT * FROM complaints WHERE id=?", (complaint_id,)).fetchone())
 
+    def _compute_ranking(self, conn: sqlite3.Connection, tender: sqlite3.Row) -> list[dict[str, Any]]:
+        bids = conn.execute("SELECT * FROM bids WHERE tender_id=? AND status IN ('opened','qualified')", (tender["id"],)).fetchall()
+        criteria = json.loads(tender["criteria"])
+        expected_criteria = {c["name"] for c in criteria}
+        ranking = []
+        for bid in bids:
+            rows = conn.execute(
+                "SELECT criterion,AVG(score) AS score FROM evaluations WHERE bid_id=? AND evaluation_round=? GROUP BY criterion",
+                (bid["id"], tender["evaluation_round"]),
+            ).fetchall()
+            scores = {row["criterion"]: row["score"] for row in rows}
+            if set(scores) != expected_criteria:
+                raise DomainError("投标尚未完成全部评分: %s" % bid["id"], 409)
+            weighted = 0.0
+            for criterion in criteria:
+                weighted += scores[criterion["name"]] * criterion["weight"] / 100
+            ranking.append({"bid_id": bid["id"], "vendor_id": bid["vendor_id"], "price": bid["price"], "score": round(weighted, 2)})
+        if not ranking:
+            raise DomainError("没有可公示的有效投标", 409)
+        ranking.sort(key=lambda item: (-item["score"], item["price"], item["bid_id"]))
+        return ranking
+
+    def _announcement_view(self, conn: sqlite3.Connection, row: sqlite3.Row, role: str) -> dict[str, Any]:
+        if role in {"procurement", "supervisor", "auditor"}:
+            candidates = [{"rank": index + 1, "bid_id": item["bid_id"], "vendor_id": item["vendor_id"],
+                           "price": item["price"], "score": item["score"]}
+                          for index, item in enumerate(json.loads(row["ranking_snapshot"]))]
+            objections = [dict(r) for r in conn.execute(
+                "SELECT id,announcement_id,tender_id,objector,body,status,resolution,reviewed_by,created_at,resolved_at FROM objections WHERE announcement_id=? ORDER BY id",
+                (row["id"],),
+            ).fetchall()]
+        else:
+            candidates = [{"rank": index + 1, "bid_id": item["bid_id"], "vendor_id": item["vendor_id"]}
+                          for index, item in enumerate(json.loads(row["ranking_snapshot"]))]
+            objections = []
+        return {
+            "id": row["id"],
+            "tender_id": row["tender_id"],
+            "evaluation_round": row["evaluation_round"],
+            "status": row["status"],
+            "candidates": candidates,
+            "objection_deadline": row["objection_deadline"],
+            "published_by": row["published_by"],
+            "published_at": row["published_at"],
+            "invalidated_at": row["invalidated_at"],
+            "objections": objections,
+        }
+
+    def publish_announcement(self, actor: str, role: str, tender_id: int,
+                             objection_deadline: str, expected_version: int) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor"}, "发布结果公示")
+        deadline = parse_time(objection_deadline)
+        if deadline <= datetime.now(timezone.utc):
+            raise DomainError("异议截止时间必须晚于当前时间")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            tender = self._tender(conn, tender_id)
+            if tender["status"] not in {"opened", "reevaluation"}:
+                raise DomainError("当前项目不能发布结果公示", 409)
+            if tender["version"] != int(expected_version):
+                raise DomainError("项目已变化，请刷新后重试", 409)
+            open_complaint = conn.execute(
+                "SELECT COUNT(*) AS c FROM complaints WHERE tender_id=? AND status='open'", (tender_id,)
+            ).fetchone()["c"]
+            if open_complaint:
+                raise DomainError("存在未处理投诉，不能发布公示", 409)
+            existing = conn.execute(
+                "SELECT id FROM announcements WHERE tender_id=? AND evaluation_round=? AND status='active'",
+                (tender_id, tender["evaluation_round"]),
+            ).fetchone()
+            if existing:
+                raise DomainError("本轮评审已发布有效公示", 409)
+            ranking = self._compute_ranking(conn, tender)
+            snapshot = json.dumps(ranking, ensure_ascii=False)
+            now = utcnow()
+            try:
+                cur = conn.execute(
+                    """INSERT INTO announcements(tender_id,evaluation_round,status,ranking_snapshot,winner_bid_id,
+                                                 objection_deadline,published_by,published_at)
+                       VALUES(?,?, 'active',?,?,?,?,?)""",
+                    (tender_id, tender["evaluation_round"], snapshot, ranking[0]["bid_id"],
+                     deadline.isoformat(timespec="seconds"), actor, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("本轮评审已发布有效公示", 409) from exc
+            conn.execute(
+                "UPDATE tenders SET status='announcing',evaluations_locked=1,version=version+1,updated_at=? WHERE id=?",
+                (now, tender_id),
+            )
+            self._audit(conn, tender_id, actor, "announcement.published",
+                        {"announcement_id": cur.lastrowid, "round": tender["evaluation_round"],
+                         "objection_deadline": deadline.isoformat(timespec="seconds")})
+            row = conn.execute("SELECT * FROM announcements WHERE id=?", (cur.lastrowid,)).fetchone()
+            return {"announcement": self._announcement_view(conn, row, role)}
+
+    def submit_objection(self, actor: str, role: str, tender_id: int, body: str) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"vendor"}, "提出异议")
+        if not body.strip():
+            raise DomainError("异议内容不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            tender = self._tender(conn, tender_id)
+            announcement = conn.execute(
+                "SELECT * FROM announcements WHERE tender_id=? AND evaluation_round=? AND status='active'",
+                (tender_id, tender["evaluation_round"]),
+            ).fetchone()
+            if tender["status"] != "announcing" or not announcement:
+                raise DomainError("当前不在结果公示期，不能提出异议", 409)
+            if datetime.now(timezone.utc) >= parse_time(announcement["objection_deadline"]):
+                raise DomainError("异议截止时间已过", 409)
+            cur = conn.execute(
+                "INSERT INTO objections(announcement_id,tender_id,objector,body,created_at) VALUES(?,?,?,?,?)",
+                (announcement["id"], tender_id, actor, body.strip(), utcnow()),
+            )
+            self._audit(conn, tender_id, actor, "objection.submitted", {"objection_id": cur.lastrowid})
+            return dict(conn.execute("SELECT * FROM objections WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def resolve_objection(self, actor: str, role: str, objection_id: int, decision: str,
+                          resolution: str) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor"}, "处理异议")
+        if decision not in {"accepted", "rejected"} or not resolution.strip():
+            raise DomainError("异议决定或处理说明无效")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            objection = conn.execute("SELECT * FROM objections WHERE id=?", (objection_id,)).fetchone()
+            if not objection:
+                raise DomainError("异议不存在", 404)
+            if objection["status"] != "open":
+                raise DomainError("异议已经处理", 409)
+            announcement = conn.execute(
+                "SELECT * FROM announcements WHERE id=?", (objection["announcement_id"],)
+            ).fetchone()
+            if not announcement or announcement["status"] != "active":
+                raise DomainError("公示已失效，不能处理异议", 409)
+            now = utcnow()
+            conn.execute(
+                "UPDATE objections SET status=?,resolution=?,reviewed_by=?,resolved_at=? WHERE id=?",
+                (decision, resolution.strip(), actor, now, objection_id),
+            )
+            if decision == "accepted":
+                tender = self._tender(conn, objection["tender_id"])
+                if tender["status"] != "announcing":
+                    raise DomainError("当前项目不能重新评审", 409)
+                conn.execute(
+                    "UPDATE announcements SET status='invalid',invalidated_at=? WHERE id=?",
+                    (now, announcement["id"]),
+                )
+                conn.execute(
+                    """UPDATE tenders SET status='reevaluation',evaluation_round=evaluation_round+1,
+                                          evaluations_locked=0,version=version+1,updated_at=? WHERE id=?""",
+                    (now, objection["tender_id"]),
+                )
+            self._audit(conn, objection["tender_id"], actor, "objection.resolved",
+                        {"objection_id": objection_id, "decision": decision})
+            return dict(conn.execute("SELECT * FROM objections WHERE id=?", (objection_id,)).fetchone())
+
     def award_tender(self, actor: str, role: str, tender_id: int, expected_version: int) -> dict[str, Any]:
         actor = clean_actor(actor)
         require_role(role, {"supervisor"}, "授标")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             tender = self._tender(conn, tender_id)
-            if tender["status"] not in {"opened", "reevaluation"}:
-                raise DomainError("当前项目不能授标", 409)
+            if tender["status"] != "announcing":
+                raise DomainError("结果公示完成前不能授标", 409)
             if tender["version"] != int(expected_version):
                 raise DomainError("项目已变化，请刷新后重试", 409)
+            announcement = conn.execute(
+                "SELECT * FROM announcements WHERE tender_id=? AND evaluation_round=? AND status='active'",
+                (tender_id, tender["evaluation_round"]),
+            ).fetchone()
+            if not announcement:
+                raise DomainError("缺少有效结果公示，不能授标", 409)
+            if datetime.now(timezone.utc) < parse_time(announcement["objection_deadline"]):
+                raise DomainError("公示期未满，不能授标", 409)
+            open_objection = conn.execute(
+                "SELECT COUNT(*) AS c FROM objections WHERE announcement_id=? AND status='open'",
+                (announcement["id"],),
+            ).fetchone()["c"]
+            if open_objection:
+                raise DomainError("存在未处理异议，不能授标", 409)
             open_complaint = conn.execute("SELECT COUNT(*) AS c FROM complaints WHERE tender_id=? AND status='open'", (tender_id,)).fetchone()["c"]
             if open_complaint:
                 raise DomainError("存在未处理投诉，不能授标", 409)
-            bids = conn.execute("SELECT * FROM bids WHERE tender_id=? AND status IN ('opened','qualified')", (tender_id,)).fetchall()
-            criteria = json.loads(tender["criteria"])
-            expected_criteria = {c["name"] for c in criteria}
-            ranking = []
-            for bid in bids:
-                rows = conn.execute(
-                    "SELECT criterion,AVG(score) AS score FROM evaluations WHERE bid_id=? AND evaluation_round=? GROUP BY criterion",
-                    (bid["id"], tender["evaluation_round"]),
-                ).fetchall()
-                scores = {row["criterion"]: row["score"] for row in rows}
-                if set(scores) != expected_criteria:
-                    raise DomainError("投标尚未完成全部评分: %s" % bid["id"], 409)
-                weighted = 0.0
-                for criterion in criteria:
-                    weighted += scores[criterion["name"]] * criterion["weight"] / 100
-                ranking.append({"bid_id": bid["id"], "vendor_id": bid["vendor_id"], "price": bid["price"], "score": round(weighted, 2)})
-            if not ranking:
-                raise DomainError("没有可授标的有效投标", 409)
-            ranking.sort(key=lambda item: (-item["score"], item["price"], item["bid_id"]))
-            winner = ranking[0]
-            snapshot = {"tender_id": tender_id, "round": tender["evaluation_round"], "ranking": ranking, "winner": winner, "awarded_by": actor, "awarded_at": utcnow()}
+            ranking = json.loads(announcement["ranking_snapshot"])
+            winner = next(item for item in ranking if item["bid_id"] == announcement["winner_bid_id"])
+            snapshot = {"tender_id": tender_id, "round": tender["evaluation_round"],
+                        "announcement_id": announcement["id"], "ranking": ranking,
+                        "winner": winner, "awarded_by": actor, "awarded_at": utcnow()}
+            now = utcnow()
             conn.execute(
                 "UPDATE tenders SET status='awarded',awarded_bid_id=?,award_snapshot=?,evaluations_locked=1,version=version+1,updated_at=? WHERE id=? AND version=?",
-                (winner["bid_id"], json.dumps(snapshot, ensure_ascii=False), utcnow(), tender_id, expected_version),
+                (winner["bid_id"], json.dumps(snapshot, ensure_ascii=False), now, tender_id, expected_version),
             )
             conn.execute("UPDATE bids SET status='awarded',version=version+1 WHERE id=?", (winner["bid_id"],))
-            self._audit(conn, tender_id, actor, "tender.awarded", {"winner": winner, "ranking": ranking})
+            self._audit(conn, tender_id, actor, "tender.awarded",
+                        {"winner": winner, "announcement_id": announcement["id"], "round": tender["evaluation_round"]})
             return {"tender": dict(self._tender(conn, tender_id)), "award": snapshot}
 
     def get_tender(self, actor: str, role: str, tender_id: int) -> dict[str, Any]:
         with self.connect() as conn:
             tender = dict(self._tender(conn, tender_id))
+            active = conn.execute(
+                "SELECT * FROM announcements WHERE tender_id=? AND evaluation_round=? AND status='active'",
+                (tender_id, tender["evaluation_round"]),
+            ).fetchone()
+            if role in {"procurement", "supervisor", "auditor"}:
+                announcement_rows = conn.execute(
+                    "SELECT * FROM announcements WHERE tender_id=? ORDER BY id", (tender_id,)
+                ).fetchall()
+                announcement = self._announcement_view(conn, announcement_rows[-1], role) if announcement_rows else None
+            elif active:
+                announcement = self._announcement_view(conn, active, role)
+            else:
+                announcement = None
             bids = []
-            if role in {"procurement", "supervisor", "auditor"} and tender["status"] in {"opened", "reevaluation", "awarded"}:
+            if role in {"procurement", "supervisor", "auditor"} and tender["status"] in {"opened", "reevaluation", "announcing", "awarded"}:
                 bids = [dict(r) for r in conn.execute("SELECT * FROM bids WHERE tender_id=? ORDER BY id", (tender_id,)).fetchall()]
             elif role == "vendor":
                 bids = []
@@ -570,7 +768,7 @@ class ProcurementService:
                 ).fetchall():
                     item = dict(row)
                     item.pop("tender_status", None)
-                    if tender["status"] not in {"opened", "reevaluation", "awarded"}:
+                    if tender["status"] not in {"opened", "reevaluation", "announcing", "awarded"}:
                         item.pop("payload", None)
                     bids.append(item)
             else:
@@ -582,18 +780,27 @@ class ProcurementService:
                 "SELECT id,tender_id,vendor_id,question,answer,status,answered_at FROM clarifications WHERE tender_id=? AND status='published' ORDER BY id",
                 (tender_id,),
             ).fetchall()]
-            return {"tender": tender, "bids": bids, "clarifications": clarifications}
+            return {"tender": tender, "bids": bids, "clarifications": clarifications, "announcement": announcement}
 
     def state(self, actor: str = "", role: str = "public") -> dict[str, Any]:
         with self.connect() as conn:
             tenders = [dict(r) for r in conn.execute(
                 "SELECT id,tender_no,title,description,status,deadline,evaluation_round,version,awarded_bid_id,created_at,updated_at FROM tenders ORDER BY id DESC"
             ).fetchall()]
+            announcement_rows = conn.execute(
+                """SELECT a.* FROM announcements a JOIN tenders t ON t.id=a.tender_id
+                   WHERE a.evaluation_round=t.evaluation_round AND a.status='active' ORDER BY a.id DESC"""
+            ).fetchall()
+            announcements = []
+            for row in announcement_rows:
+                view = self._announcement_view(conn, row, role)
+                view["tender_no"] = conn.execute("SELECT tender_no FROM tenders WHERE id=?", (row["tender_id"],)).fetchone()["tender_no"]
+                announcements.append(view)
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 200").fetchall()]
             if role in {"procurement", "supervisor", "auditor"}:
                 bids = [dict(r) for r in conn.execute(
                     """SELECT b.id,b.tender_id,b.vendor_id,b.price,b.status,b.payload_hash,b.submitted_at,b.opened_at,
-                              CASE WHEN t.status IN ('opened','reevaluation','awarded') THEN b.payload ELSE NULL END AS payload
+                              CASE WHEN t.status IN ('opened','reevaluation','announcing','awarded') THEN b.payload ELSE NULL END AS payload
                        FROM bids b JOIN tenders t ON t.id=b.tender_id ORDER BY b.id DESC LIMIT 200"""
                 ).fetchall()]
                 complaints = [dict(r) for r in conn.execute("SELECT * FROM complaints ORDER BY id DESC LIMIT 100").fetchall()]
@@ -606,7 +813,7 @@ class ProcurementService:
                 ).fetchall():
                     item = dict(row)
                     status = item.pop("tender_status")
-                    if status not in {"opened", "reevaluation", "awarded"}:
+                    if status not in {"opened", "reevaluation", "announcing", "awarded"}:
                         item.pop("payload", None)
                     bids.append(item)
                 complaints = [dict(r) for r in conn.execute(
@@ -614,7 +821,8 @@ class ProcurementService:
                 ).fetchall()]
             else:
                 bids, complaints = [], []
-        return {"tenders": tenders, "bids": bids, "complaints": complaints, "timeline": timeline, "role": role}
+        return {"tenders": tenders, "bids": bids, "complaints": complaints, "announcements": announcements,
+                "timeline": timeline, "role": role}
 
     def seed_demo(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -716,6 +924,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.resolve_complaint(actor, role, **data)
             elif path == "/api/tenders/award":
                 result = self.service.award_tender(actor, role, **data)
+            elif path == "/api/tenders/announce":
+                result = self.service.publish_announcement(actor, role, **data)
+            elif path == "/api/objections":
+                result = self.service.submit_objection(actor, role, **data)
+            elif path == "/api/objections/resolve":
+                result = self.service.resolve_objection(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)

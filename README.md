@@ -24,7 +24,20 @@ python3 app.py
 - `POST /api/conflicts`、`POST /api/evaluations`
 - `POST /api/clarifications`、`POST /api/clarifications/answer`
 - `POST /api/complaints`、`POST /api/complaints/resolve`
-- `POST /api/tenders/award`：锁定评分轮次并保存排名快照
+- `POST /api/tenders/announce`：监督员冻结当前排名并发布结果公示，写明异议截止时间
+- `POST /api/objections`：供应商在公示期内提出异议
+- `POST /api/objections/resolve`：监督员处理异议，受理后公示失效并进入重新评审
+- `POST /api/tenders/award`：公示期满且无未处理异议后，按公示排名快照授标
+
+## 结果公示与异议
+
+评标完成后、授标之前必须经过结果公示：
+
+1. 监督员调用 `/api/tenders/announce` 把当前评审轮次的排名冻结成公示，并指定异议截止时间；同一评审轮次只保留一条有效公示（重复发布返回 409）。发布后项目进入 `announcing`，评分锁定、暂停授标。
+2. 公示期内供应商可通过 `/api/objections` 提出异议；截止后不再受理。
+3. 监督员 `/api/objections/resolve` 处理异议：驳回不影响公示；受理（accepted）后当前公示标记为 `invalid`，项目进入 `reevaluation` 且评审轮次 +1，需要重新评分并重新公示。
+4. 只有异议截止时间已过、没有未处理异议（及投诉）时，监督员才能按**公示冻结的排名快照**授标；之后即使评分数据被改动也不会改写授标结果。
+5. 公开页（`public`）在公示期只展示候选名次、供应商/投标编号和异议截止时间，不展示评分与报价；监督员等内部角色可看到完整快照与异议列表。
 
 ## 测试
 

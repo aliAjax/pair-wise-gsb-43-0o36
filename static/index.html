@@ -1,6 +1,23 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>公共采购密封投标</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1180px;margin:28px auto;padding:0 20px;color:#28343e}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d5dde3;padding:7px}th{background:#eef4f7}.card{background:#eef8f3;border-left:5px solid #23845b;padding:12px 16px}code{background:#edf0f2;padding:2px 5px}</style>
+<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1180px;margin:28px auto;padding:0 20px;color:#28343e}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d5dde3;padding:7px}th{background:#eef4f7}.card{background:#eef8f3;border-left:5px solid #23845b;padding:12px 16px}.notice{background:#fff7e8;border-left:5px solid #d9920f;padding:12px 16px;margin:14px 0}code{background:#edf0f2;padding:2px 5px}</style>
 <h1>公共采购密封投标与评审</h1><div class="card">公开页面只展示项目元数据，投标正文按角色和执行阶段隐藏。写接口需要 <code>X-User</code>、<code>X-Role</code>。</div>
+<h2>结果公示</h2><div id="announcement-list"></div>
 <h2>采购项目</h2><table id="tenders"><thead><tr><th>编号</th><th>标题</th><th>状态</th><th>截止时间</th><th>评审轮次</th><th>版本</th></tr></thead><tbody></tbody></table>
 <h2>投标元数据</h2><table id="bids"><thead><tr><th>项目</th><th>供应商</th><th>报价</th><th>状态</th><th>承诺哈希</th></tr></thead><tbody></tbody></table>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#tenders tbody').innerHTML=d.tenders.map(r=>`<tr><td>${r.tender_no}</td><td>${r.title}</td><td>${r.status}</td><td>${r.deadline}</td><td>${r.evaluation_round}</td><td>${r.version}</td></tr>`).join('');document.querySelector('#bids tbody').innerHTML=d.bids.map(r=>`<tr><td>${r.tender_id}</td><td>${r.vendor_id}</td><td>${r.price}</td><td>${r.status}</td><td>${r.payload_hash.slice(0,12)}…</td></tr>`).join('')}load()</script></html>
+<script>
+async function load(){
+  const d=await fetch('/api/state').then(r=>r.json());
+  const list=document.querySelector('#announcement-list');
+  if(!d.announcements||!d.announcements.length){
+    list.innerHTML='<div class="notice">当前没有进行中的结果公示。</div>';
+  }else{
+    list.innerHTML=d.announcements.map(a=>{
+      const rows=(a.candidates||[]).map(c=>`<tr><td>${c.rank}</td><td>${c.vendor_id}</td><td>${c.bid_id}</td></tr>`).join('');
+      return `<div class="notice"><strong>项目 ${a.tender_no}（第 ${a.evaluation_round} 轮评审）</strong>：公示中，异议截止时间 <code>${a.objection_deadline}</code>。公示期间暂停授标，供应商可提出异议。<table><thead><tr><th>候选名次</th><th>供应商</th><th>投标编号</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    }).join('');
+  }
+  document.querySelector('#tenders tbody').innerHTML=d.tenders.map(r=>`<tr><td>${r.tender_no}</td><td>${r.title}</td><td>${r.status}</td><td>${r.deadline}</td><td>${r.evaluation_round}</td><td>${r.version}</td></tr>`).join('');
+  document.querySelector('#bids tbody').innerHTML=(d.bids||[]).map(r=>`<tr><td>${r.tender_id}</td><td>${r.vendor_id}</td><td>${r.price}</td><td>${r.status}</td><td>${r.payload_hash.slice(0,12)}…</td></tr>`).join('');
+}
+load();
+</script></html>
